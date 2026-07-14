@@ -448,7 +448,12 @@ if bot:
             if cid not in chat_sessions:
                 chat_sessions[cid] = client.chats.create(model=GEMINI_MODEL)
             response = chat_sessions[cid].send_message(message.text)
-            bot.reply_to(message, response.text)
+            # Try rich Markdown first; if Telegram rejects the formatting
+            # (e.g. unclosed asterisk from Gemini), fall back to plain text.
+            try:
+                bot.reply_to(message, response.text, parse_mode="Markdown")
+            except Exception:
+                bot.reply_to(message, response.text)
         except Exception as e:
             bot.reply_to(message, f"❌ Ошибка Gemini: {e}")
 
