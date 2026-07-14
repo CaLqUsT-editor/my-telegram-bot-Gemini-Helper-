@@ -221,6 +221,83 @@ def parse_remind_args(text: str) -> tuple[str, str] | None:
 # ---------------------------------------------------------------------------
 if bot:
 
+    # ── /sheets_debug (admin) ─────────────────────────────────────────────────
+    @bot.message_handler(commands=["sheets_debug"])
+    @admin_only
+    def handle_sheets_debug(message):
+        """Run a full diagnostic of the Google Sheets connection and report."""
+        lines = ["🔍 *Диагностика Google Sheets*\n"]
+
+        # 1. Check env var presence
+        creds_raw  = os.getenv("GOOGLE_SHEETS_CREDENTIALS")
+        sheet_name = os.getenv("GOOGLE_SHEET_NAME", "TelegramBotReminders")
+
+        if not creds_raw:
+            lines.append("❌ *GOOGLE\\_SHEETS\\_CREDENTIALS* — переменная не найдена!")
+            lines.append("👉 Проверь, что добавил её на Render в разделе Environment.")
+            bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+            return
+        lines.append(f"✅ *GOOGLE\\_SHEETS\\_CREDENTIALS* — найдена ({len(creds_raw)} символов)")
+        lines.append(f"✅ *GOOGLE\\_SHEET\\_NAME* = `{sheet_name}`\n")
+
+        # 2. JSON parse check
+        try:
+            creds_dict   = json.loads(creds_raw)
+            client_email = creds_dict.get("client_email", "не найден")
+            project_id   = creds_dict.get("project_id",  "не найден")
+            lines.append("✅ *JSON парсинг* — успешно")
+            lines.append(f"  • project\\_id: `{project_id}`")
+            lines.append(f"  • client\\_email: `{client_email}`\n")
+        except json.JSONDecodeError as e:
+            lines.append(f"❌ *JSON парсинг провалился!*\n`{e}`")
+            lines.append("👉 Скопируй содержимое JSON-файла заново — возможно, потерялась кавычка или скобка.")
+            bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+            return
+
+        # 3. Google Auth check
+        try:
+            from google.oauth2.service_account import Credentials as _Creds
+            _creds = _Creds.from_service_account_info(
+                creds_dict,
+                scopes=[
+                    "https://spreadsheets.google.com/feeds",
+                    "https://www.googleapis.com/auth/drive",
+                ],
+            )
+            lines.append("✅ *Google Auth* — сервисный аккаунт создан успешно\n")
+        except Exception as e:
+            lines.append(f"❌ *Google Auth провалился!*\n`{e}`")
+            lines.append("👉 Возможно, повреждён `private_key` в JSON.")
+            bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+            return
+
+        # 4. gspread connect & open spreadsheet
+        try:
+            import gspread as _gs
+            _gc = _gs.authorize(_creds)
+            lines.append("✅ *gspread авторизация* — успешно\n")
+            try:
+                _spreadsheet = _gc.open(sheet_name)
+                _ws = _spreadsheet.sheet1
+                _ws.row_values(1)  # real read to confirm access
+                lines.append(f"✅ *Таблица '{sheet_name}'* — открыта и доступна!")
+                lines.append("\n🎉 *Всё настроено правильно!*")
+            except _gs.exceptions.SpreadsheetNotFound:
+                lines.append(f"❌ *Таблица '{sheet_name}' не найдена!*")
+                lines.append("👉 Две самые частые причины:")
+                lines.append(f"  1. Имя таблицы написано не так — проверь пробелы и регистр букв.")
+                lines.append(f"  2. Таблица не расшарена сервисному аккаунту `{client_email}`.")
+                lines.append(f"     Открой таблицу → Share → вставь этот email → Editor → Share.")
+            except Exception as e:
+                lines.append(f"❌ *Ошибка при открытии таблицы:*\n`{e}`")
+        except Exception as e:
+            lines.append(f"❌ *gspread авторизация провалилась:*\n`{e}`")
+            lines.append("👉 Возможно, не включён Google Sheets API или Google Drive API в Cloud Console.")
+
+        bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+
+
+
     # ── /start  /clear ──────────────────────────────────────────────────────
     @bot.message_handler(commands=["start", "clear"])
     def handle_start_clear(message):
