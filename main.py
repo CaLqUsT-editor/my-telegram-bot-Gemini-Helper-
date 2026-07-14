@@ -318,8 +318,11 @@ if bot:
             "📋 *Команды бота:*\n"
             "/start — начать / сбросить диалог\n"
             "/clear — очистить память диалога\n"
-            "/remind `<задача> <ГГГГ-ММ-ДД ЧЧ:ММ>` — добавить напоминание\n"
-            "  _Пример:_ `/remind Купить молоко 2024-07-15 14:30`\n"
+            "/remind `<задача и время>` — добавить напоминание\n"
+            "  _Примеры:_\n"
+            "  `/remind Через 2 часа отдать ролики Диме`\n"
+            "  `/remind Завтра в 9 утра позвонить врачу`\n"
+            "  `/remind В пятницу в 18:00 встреча`\n"
             "/list — список активных напоминаний\n"
             "/done `<номер>` — отметить напоминание выполненным\n"
             "/help — эта справка\n"
@@ -339,25 +342,99 @@ if bot:
             bot.reply_to(message, "❌ Google Sheets не настроены. Напоминания недоступны.")
             return
 
-        parsed = parse_remind_args(message.text)
-        if not parsed:
+        # Strip the /remind command prefix to get the raw reminder text
+        raw_text = message.text.strip()
+        if raw_text.startswith("/remind"):
+            raw_text = raw_text[len("/remind"):].strip()
+
+        if not raw_text:
             bot.reply_to(
                 message,
-                "❌ Неверный формат.\n"
-                "Используй: `/remind <задача> <ГГГГ-ММ-ДД ЧЧ:ММ>`\n"
-                "Пример: `/remind Позвонить врачу 2024-07-20 09:00`",
+                "✏️ Напиши что и когда тебе напомнить.\n"
+                "Можно писать по-человечески:\n"
+                "`/remind Через 2 часа сдать отчёт`\n"
+                "`/remind Завтра в 9 утра позвонить врачу`\n"
+                "`/remind В пятницу в 18:00 встреча с Димой`",
                 parse_mode="Markdown",
             )
             return
 
-        task, due_time = parsed
+        # First try strict format (no Gemini needed, instant)
+        strict = parse_remind_args(message.text)
+        if strict:
+            task, due_time = strict
+        else:
+            # Natural language → Gemini parsing
+            if not client:
+                bot.reply_to(
+                    message,
+                    "❌ Gemini недоступен, используй строгий формат:\n"
+                    "`/remind <задача> <ГГГГ-ММ-ДД ЧЧ:ММ>`",
+                    parse_mode="Markdown",
+                )
+                return
+
+            bot.send_chat_action(message.chat.id, "typing")
+
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+            prompt = (
+                f"Сейчас: {now_str}.\n"
+                f"Пользователь хочет поставить напоминание: «{raw_text}»\n\n"
+                "Определи:\n"
+                "1. task — краткое описание задачи (без упоминания времени)\n"
+                "2. due_time — точная дата и время в формате YYYY-MM-DD HH:MM, "
+                "вычисленная относительно текущего момента.\n\n"
+                "Ответь СТРОГО в формате JSON без лишнего текста, например:\n"
+                '{"task": "Закончить ролики и отдать Диме", "due_time": "2024-07-14 21:36"}\n\n'
+                "Только JSON, без объяснений, без markdown-блоков."
+            )
+
+            try:
+                # Use a fresh one-off generate (not chat session) for structured output
+                gemini_response = client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=prompt,
+                )
+                raw_json = gemini_response.text.strip()
+                # Strip possible ```json fences from Gemini response
+                if raw_json.startswith("```"):
+                    raw_json = raw_json.split("```")[1]
+                    if raw_json.startswith("json"):
+                        raw_json = raw_json[4:]
+                parsed_data = json.loads(raw_json)
+                task     = parsed_data["task"].strip()
+                due_time = parsed_data["due_time"].strip()
+                # Validate that due_time is a real datetime
+                datetime.strptime(due_time, "%Y-%m-%d %H:%M")
+            except json.JSONDecodeError:
+                bot.reply_to(
+                    message,
+                    "❌ Не смог разобрать ответ нейронки. Попробуй написать точнее:\n"
+                    "`/remind Позвонить врачу завтра в 10:00`",
+                    parse_mode="Markdown",
+                )
+                return
+            except (KeyError, ValueError):
+                bot.reply_to(
+                    message,
+                    "❌ Нейронка не смогла распознать время. Попробуй:\n"
+                    "`/remind Через 2 часа сдать задание`\n"
+                    "`/remind В пятницу в 15:00 встреча`",
+                    parse_mode="Markdown",
+                )
+                return
+            except Exception as e:
+                bot.reply_to(message, f"❌ Ошибка Gemini при разборе напоминания: {e}")
+                return
+
+        # Save to Google Sheets
         try:
             sheets_add_reminder(message.chat.id, task, due_time)
             bot.reply_to(
                 message,
-                f"✅ Напоминание добавлено!\n"
+                f"✅ *Напоминание добавлено!*\n"
                 f"📝 *Задача:* {task}\n"
-                f"🕐 *Время:* {due_time}",
+                f"🕐 *Когда:* {due_time}",
                 parse_mode="Markdown",
             )
         except Exception as e:
