@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 
 import telebot
@@ -30,6 +30,17 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "TelegramBotReminders")
+
+# Timezone offset from UTC (e.g. 3 for Moscow UTC+3).
+# Set TZ_OFFSET env variable on Render to match your timezone.
+try:
+    TZ_OFFSET = int(os.getenv("TZ_OFFSET", "3"))
+except (ValueError, TypeError):
+    TZ_OFFSET = 3
+
+def local_now() -> datetime:
+    """Return the current time in the user's timezone (UTC + TZ_OFFSET)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=TZ_OFFSET)
 
 # ADMIN ID
 try:
@@ -119,7 +130,8 @@ def reminder_checker(bot_instance):
         if gs_sheet is None:
             continue
         try:
-            now = datetime.now()
+            # Use local_now() so comparison is always in the user's timezone
+            now = local_now()
             pending = sheets_get_all_pending()
             for row in pending:
                 try:
@@ -376,9 +388,11 @@ if bot:
 
             bot.send_chat_action(message.chat.id, "typing")
 
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+            now_local = local_now()
+            now_str   = now_local.strftime("%Y-%m-%d %H:%M")
+            tz_label  = f"UTC+{TZ_OFFSET}" if TZ_OFFSET >= 0 else f"UTC{TZ_OFFSET}"
             prompt = (
-                f"Сейчас: {now_str}.\n"
+                f"Сейчас: {now_str} ({tz_label}).\n"
                 f"Пользователь хочет поставить напоминание: «{raw_text}»\n\n"
                 "Определи:\n"
                 "1. task — краткое описание задачи (без упоминания времени)\n"
