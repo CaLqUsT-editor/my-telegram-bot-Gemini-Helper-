@@ -1,274 +1,473 @@
 import os
 import sys
 import ast
+import json
 import shutil
 import subprocess
 import threading
+import time
+from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, HTTPServer
+
 import telebot
+import gspread
 from google import genai
+from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 
+# ---------------------------------------------------------------------------
 # Load environment variables
+# ---------------------------------------------------------------------------
 dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
 load_dotenv(dotenv_path=dotenv_path, override=True)
 
-# 1. Health check hook for validating new code versions
+# Health check hook – used by the dry-run subprocess validator
 if os.getenv("CHECK_HEALTH") == "1":
     print("Health check passed: Imports and initialization successful.")
     sys.exit(0)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "TelegramBotReminders")
 
-# ADMIN ID verification
-ADMIN_ID_ENV = os.getenv("ADMIN_ID")
+# ADMIN ID
 try:
-    ADMIN_ID = int(ADMIN_ID_ENV) if ADMIN_ID_ENV else None
-except ValueError:
+    ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
+except (ValueError, TypeError):
     ADMIN_ID = None
 
-# Simple HTTP Request Handler for Render health checks (standard library, no Flask required)
+# ---------------------------------------------------------------------------
+# Google Sheets setup
+# ---------------------------------------------------------------------------
+SCOPES = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive",
+]
+
+# Thread-safe lock for all Sheets access
+sheets_lock = threading.Lock()
+gs_sheet = None   # Will hold the gspread Worksheet after init
+
+def init_google_sheets():
+    """Parse credentials from env var JSON and open (or create) the worksheet."""
+    global gs_sheet
+    creds_json = os.getenv("GOOGLE_SHEETS_CREDENTIALS")
+    if not creds_json:
+        print("Warning: GOOGLE_SHEETS_CREDENTIALS not set. Reminders disabled.")
+        return None
+
+    try:
+        creds_dict = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        gc = gspread.authorize(creds)
+        spreadsheet = gc.open(GOOGLE_SHEET_NAME)
+        worksheet = spreadsheet.sheet1
+
+        # Ensure header row exists
+        if worksheet.row_values(1) != ["chat_id", "task", "due_time", "status"]:
+            worksheet.insert_row(["chat_id", "task", "due_time", "status"], index=1)
+
+        gs_sheet = worksheet
+        print("Google Sheets connected successfully.")
+        return worksheet
+    except Exception as e:
+        print(f"Google Sheets init error: {e}")
+        return None
+
+def sheets_add_reminder(chat_id: int, task: str, due_time: str) -> int:
+    """Append a new pending reminder row. Returns the new 1-based row index."""
+    with sheets_lock:
+        gs_sheet.append_row([str(chat_id), task, due_time, "pending"])
+        return len(gs_sheet.get_all_values())  # row count including header
+
+def sheets_get_pending(chat_id: int) -> list[dict]:
+    """Return all pending reminders for a given chat_id."""
+    with sheets_lock:
+        rows = gs_sheet.get_all_records()  # list of dicts
+    return [
+        {"idx": i + 2, **r}          # idx = actual sheet row (1-based, +1 for header)
+        for i, r in enumerate(rows)
+        if str(r["chat_id"]) == str(chat_id) and r["status"] == "pending"
+    ]
+
+def sheets_set_status(row_idx: int, status: str):
+    """Update the 'status' column (col 4) for a given row index."""
+    with sheets_lock:
+        gs_sheet.update_cell(row_idx, 4, status)
+
+def sheets_get_all_pending() -> list[dict]:
+    """Return every pending reminder across all users."""
+    with sheets_lock:
+        rows = gs_sheet.get_all_records()
+    return [
+        {"idx": i + 2, **r}
+        for i, r in enumerate(rows)
+        if r["status"] == "pending"
+    ]
+
+# ---------------------------------------------------------------------------
+# Background reminder checker thread
+# ---------------------------------------------------------------------------
+def reminder_checker(bot_instance):
+    """
+    Runs in a daemon thread.
+    Every 60 seconds checks the Sheet for overdue reminders and fires them.
+    """
+    while True:
+        time.sleep(60)
+        if gs_sheet is None:
+            continue
+        try:
+            now = datetime.now()
+            pending = sheets_get_all_pending()
+            for row in pending:
+                try:
+                    due = datetime.strptime(row["due_time"], "%Y-%m-%d %H:%M")
+                except ValueError:
+                    continue  # skip badly-formatted rows
+                if due <= now:
+                    chat_id = int(row["chat_id"])
+                    task    = row["task"]
+                    try:
+                        bot_instance.send_message(
+                            chat_id,
+                            f"⏰ Напоминание: *{task}*",
+                            parse_mode="Markdown",
+                        )
+                        sheets_set_status(row["idx"], "sent")
+                    except Exception as e:
+                        print(f"Reminder send error for row {row['idx']}: {e}")
+        except Exception as e:
+            print(f"Reminder checker error: {e}")
+
+# ---------------------------------------------------------------------------
+# Render health-check HTTP server (built-in, no Flask)
+# ---------------------------------------------------------------------------
 class HealthCheckHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
-        if self.path == '/':
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html; charset=utf-8')
-            self.end_headers()
-            self.wfile.write("Бот активен и работает!".encode('utf-8'))
-        else:
-            self.send_response(404)
-            self.end_headers()
+        body = "Бот активен и работает!".encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-    # Disable logging to stdout to keep bot console output clean
     def log_message(self, format, *args):
-        pass
+        pass  # silence access logs
 
 def run_http_server():
     port = int(os.environ.get("PORT", 5000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", port), HealthCheckHandler).serve_forever()
 
-if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "your_telegram_bot_token_here":
-    print("Warning: TELEGRAM_TOKEN is not set correctly in the .env file.")
-
-if not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key_here":
-    print("Warning: GEMINI_API_KEY is not set correctly in the .env file.")
-
+# ---------------------------------------------------------------------------
+# Warnings
+# ---------------------------------------------------------------------------
+if not TELEGRAM_TOKEN:
+    print("Warning: TELEGRAM_TOKEN is not set.")
+if not GEMINI_API_KEY:
+    print("Warning: GEMINI_API_KEY is not set.")
 if ADMIN_ID is None:
-    print("Warning: ADMIN_ID is not configured or invalid. Self-modification will be disabled.")
+    print("Warning: ADMIN_ID is not configured. Self-modification disabled.")
 
-# Configure Gemini
-if GEMINI_API_KEY and GEMINI_API_KEY != "your_gemini_api_key_here":
-    client = genai.Client(api_key=GEMINI_API_KEY)
-else:
-    client = None
+# ---------------------------------------------------------------------------
+# Gemini client
+# ---------------------------------------------------------------------------
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-# Initialize Bot
-if TELEGRAM_TOKEN and TELEGRAM_TOKEN != "your_telegram_bot_token_here":
-    bot = telebot.TeleBot(TELEGRAM_TOKEN)
-else:
-    bot = None
+# ---------------------------------------------------------------------------
+# Telegram bot
+# ---------------------------------------------------------------------------
+bot = telebot.TeleBot(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
 
-# Dictionary to hold chat sessions (context memory)
-chat_sessions = {}
+# Per-user Gemini chat sessions (in-memory)
+chat_sessions: dict[int, object] = {}
 
-# Admin verification helper decorator
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 def admin_only(func):
+    """Decorator: allow only ADMIN_ID to call the handler."""
     def wrapper(message, *args, **kwargs):
         if ADMIN_ID is None:
-            bot.reply_to(message, "Ошибка: ADMIN_ID не настроен на сервере.")
+            bot.reply_to(message, "❌ ADMIN_ID не настроен.")
             return
         if message.from_user.id != ADMIN_ID:
-            print(f"Unauthorized access attempt by user ID {message.from_user.id}")
+            print(f"Unauthorized attempt from {message.from_user.id}")
             return
         return func(message, *args, **kwargs)
     return wrapper
 
+def parse_remind_args(text: str) -> tuple[str, str] | None:
+    """
+    Parse '/remind Buy milk 2024-07-15 14:30'
+    Returns (task, due_time_str) or None on failure.
+    Expected format: /remind <task text> <YYYY-MM-DD HH:MM>
+    """
+    parts = text.strip().split()
+    if len(parts) < 4:
+        return None
+    # Last two tokens are date and time
+    due_time = f"{parts[-2]} {parts[-1]}"
+    task = " ".join(parts[1:-2])
+    try:
+        datetime.strptime(due_time, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+    return task, due_time
+
+# ---------------------------------------------------------------------------
+# Bot handlers
+# ---------------------------------------------------------------------------
 if bot:
-    # 2. Update Code handler
-    @bot.message_handler(commands=['update_code'], content_types=['text', 'document'])
+
+    # ── /start  /clear ──────────────────────────────────────────────────────
+    @bot.message_handler(commands=["start", "clear"])
+    def handle_start_clear(message):
+        cid = message.chat.id
+        if client:
+            chat_sessions[cid] = client.chats.create(model=GEMINI_MODEL)
+        bot.reply_to(
+            message,
+            f"👋 Привет! Я ИИ-ассистент на базе {GEMINI_MODEL}.\n"
+            "Я умею держать контекст беседы и ставить напоминания.\n"
+            "Напиши /help, чтобы узнать все команды.",
+        )
+
+    # ── /help ────────────────────────────────────────────────────────────────
+    @bot.message_handler(commands=["help"])
+    def handle_help(message):
+        text = (
+            "📋 *Команды бота:*\n"
+            "/start — начать / сбросить диалог\n"
+            "/clear — очистить память диалога\n"
+            "/remind `<задача> <ГГГГ-ММ-ДД ЧЧ:ММ>` — добавить напоминание\n"
+            "  _Пример:_ `/remind Купить молоко 2024-07-15 14:30`\n"
+            "/list — список активных напоминаний\n"
+            "/done `<номер>` — отметить напоминание выполненным\n"
+            "/help — эта справка\n"
+        )
+        if ADMIN_ID and message.from_user.id == ADMIN_ID:
+            text += (
+                "\n👑 *Админ-команды:*\n"
+                "/update\\_code `<код>` — обновить код бота\n"
+                "/rollback — откатить к предыдущей версии\n"
+            )
+        bot.reply_to(message, text, parse_mode="Markdown")
+
+    # ── /remind ──────────────────────────────────────────────────────────────
+    @bot.message_handler(commands=["remind"])
+    def handle_remind(message):
+        if gs_sheet is None:
+            bot.reply_to(message, "❌ Google Sheets не настроены. Напоминания недоступны.")
+            return
+
+        parsed = parse_remind_args(message.text)
+        if not parsed:
+            bot.reply_to(
+                message,
+                "❌ Неверный формат.\n"
+                "Используй: `/remind <задача> <ГГГГ-ММ-ДД ЧЧ:ММ>`\n"
+                "Пример: `/remind Позвонить врачу 2024-07-20 09:00`",
+                parse_mode="Markdown",
+            )
+            return
+
+        task, due_time = parsed
+        try:
+            sheets_add_reminder(message.chat.id, task, due_time)
+            bot.reply_to(
+                message,
+                f"✅ Напоминание добавлено!\n"
+                f"📝 *Задача:* {task}\n"
+                f"🕐 *Время:* {due_time}",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            bot.reply_to(message, f"❌ Ошибка при сохранении: {e}")
+
+    # ── /list ─────────────────────────────────────────────────────────────────
+    @bot.message_handler(commands=["list"])
+    def handle_list(message):
+        if gs_sheet is None:
+            bot.reply_to(message, "❌ Google Sheets не настроены.")
+            return
+
+        try:
+            reminders = sheets_get_pending(message.chat.id)
+            if not reminders:
+                bot.reply_to(message, "📭 У тебя нет активных напоминаний.")
+                return
+
+            lines = ["📋 *Твои активные напоминания:*\n"]
+            for i, r in enumerate(reminders, start=1):
+                lines.append(f"{i}. 📝 *{r['task']}* — 🕐 {r['due_time']}  `(id: {r['idx']})`")
+
+            bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+        except Exception as e:
+            bot.reply_to(message, f"❌ Ошибка при получении списка: {e}")
+
+    # ── /done ─────────────────────────────────────────────────────────────────
+    @bot.message_handler(commands=["done"])
+    def handle_done(message):
+        if gs_sheet is None:
+            bot.reply_to(message, "❌ Google Sheets не настроены.")
+            return
+
+        parts = message.text.strip().split()
+        if len(parts) != 2 or not parts[1].isdigit():
+            bot.reply_to(
+                message,
+                "❌ Укажи ID напоминания.\n"
+                "Пример: `/done 5`\n"
+                "ID можно узнать из команды /list.",
+                parse_mode="Markdown",
+            )
+            return
+
+        row_idx = int(parts[1])
+        try:
+            # Verify this row belongs to the requesting user before marking done
+            with sheets_lock:
+                cell_chat_id = gs_sheet.cell(row_idx, 1).value
+            if str(cell_chat_id) != str(message.chat.id):
+                bot.reply_to(message, "❌ Напоминание с таким ID не найдено.")
+                return
+
+            sheets_set_status(row_idx, "done")
+            bot.reply_to(message, f"✅ Напоминание #{row_idx} отмечено как выполненное!")
+        except Exception as e:
+            bot.reply_to(message, f"❌ Ошибка: {e}")
+
+    # ── /update_code (self-modification) ─────────────────────────────────────
+    @bot.message_handler(commands=["update_code"], content_types=["text", "document"])
     @admin_only
     def handle_update_code(message):
         code_content = None
-        
-        # Check if code is sent as a document attachment
+
         if message.document:
             try:
-                file_info = bot.get_file(message.document.file_id)
-                downloaded_file = bot.download_file(file_info.file_path)
-                code_content = downloaded_file.decode('utf-8')
+                fi = bot.get_file(message.document.file_id)
+                code_content = bot.download_file(fi.file_path).decode("utf-8")
             except Exception as e:
-                bot.reply_to(message, f"Ошибка при загрузке файла: {e}")
+                bot.reply_to(message, f"❌ Ошибка загрузки файла: {e}")
                 return
         else:
-            # Extract code from text
-            text = message.text or message.caption or ""
-            # Strip command name
+            text = (message.text or message.caption or "").strip()
             if text.startswith("/update_code"):
                 text = text[len("/update_code"):].strip()
-            
-            # Clean up markdown code blocks
-            if text.startswith("```python"):
-                text = text[9:]
-            elif text.startswith("```"):
-                text = text[3:]
+            # Strip markdown code fences
+            for fence in ("```python", "```"):
+                if text.startswith(fence):
+                    text = text[len(fence):]
+                    break
             if text.endswith("```"):
                 text = text[:-3]
-            
             code_content = text.strip()
 
         if not code_content:
-            bot.reply_to(
-                message, 
-                "Пожалуйста, пришлите код после команды `/update_code` (или в виде прикрепленного файла `main.py`)."
-            )
+            bot.reply_to(message, "Пришли код текстом или файлом вместе с командой.")
             return
 
-        bot.reply_to(message, "Начинаю валидацию кода...")
+        bot.reply_to(message, "🔍 Начинаю валидацию кода...")
 
-        # Step A: Validate syntax using AST
+        # Step A – AST syntax check
         try:
             ast.parse(code_content)
-        except SyntaxError as syntax_err:
-            error_details = (
-                f"❌ Ошибка синтаксиса (AST validation failed):\n"
-                f"Строка: {syntax_err.lineno}, Смещение: {syntax_err.offset}\n"
-                f"Ошибка: {syntax_err.msg}\n"
-                f"Код: `{syntax_err.text.strip() if syntax_err.text else ''}`"
+        except SyntaxError as e:
+            bot.reply_to(
+                message,
+                f"❌ Синтаксическая ошибка:\n"
+                f"Строка {e.lineno}, смещение {e.offset}\n"
+                f"{e.msg}\n`{(e.text or '').strip()}`",
+                parse_mode="Markdown",
             )
-            bot.reply_to(message, error_details)
-            return
-        except Exception as e:
-            bot.reply_to(message, f"❌ Ошибка парсинга AST: {e}")
             return
 
-        # Step B: Subprocess dry-run check
-        temp_filename = "main.py.tmp"
+        # Step B – subprocess dry-run
+        tmp = "main.py.tmp"
         try:
-            with open(temp_filename, "w", encoding="utf-8") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 f.write(code_content)
-            
-            # Run the new script with CHECK_HEALTH environment variable set to "1"
-            run_env = os.environ.copy()
-            run_env["CHECK_HEALTH"] = "1"
-            
+            env = {**os.environ, "CHECK_HEALTH": "1"}
             result = subprocess.run(
-                [sys.executable, temp_filename],
-                capture_output=True,
-                text=True,
-                env=run_env,
-                timeout=10
+                [sys.executable, tmp],
+                capture_output=True, text=True, env=env, timeout=10,
             )
-            
             if result.returncode != 0:
-                error_details = (
-                    f"❌ Тестовый запуск завершился с ошибкой (код {result.returncode}):\n\n"
-                    f"**stderr:**\n```\n{result.stderr}\n```\n"
-                    f"**stdout:**\n```\n{result.stdout}\n```"
+                bot.reply_to(
+                    message,
+                    f"❌ Ошибка при тестовом запуске (код {result.returncode}):\n"
+                    f"```\n{result.stderr[:1500]}\n```",
+                    parse_mode="Markdown",
                 )
-                bot.reply_to(message, error_details)
-                if os.path.exists(temp_filename):
-                    os.remove(temp_filename)
+                os.remove(tmp)
                 return
-
         except Exception as e:
-            bot.reply_to(message, f"❌ Не удалось провести проверку запуска: {e}")
-            if os.path.exists(temp_filename):
-                os.remove(temp_filename)
+            bot.reply_to(message, f"❌ Не удалось выполнить проверку: {e}")
+            if os.path.exists(tmp):
+                os.remove(tmp)
             return
 
-        # Step C: Apply changes and restart
+        # Step C – apply & hot-reload
         try:
-            # Backup current main.py
             shutil.copy("main.py", "main.py.bak")
-            
-            # Move temp file to main.py
-            shutil.move(temp_filename, "main.py")
-            
-            bot.reply_to(message, "✅ Валидация успешна! Бэкап создан. Перезапускаю бота...")
-            
-            # Stop polling and execute self
+            shutil.move(tmp, "main.py")
+            bot.reply_to(message, "✅ Код обновлён. Бэкап создан. Перезапускаю бота...")
             bot.stop_polling()
             os.execv(sys.executable, [sys.executable] + sys.argv)
         except Exception as e:
-            bot.reply_to(message, f"❌ Ошибка во время горячей перезагрузки: {e}")
+            bot.reply_to(message, f"❌ Ошибка перезагрузки: {e}")
             if os.path.exists("main.py.bak") and not os.path.exists("main.py"):
                 shutil.copy("main.py.bak", "main.py")
 
-    # 3. Rollback command
-    @bot.message_handler(commands=['rollback'])
+    # ── /rollback ─────────────────────────────────────────────────────────────
+    @bot.message_handler(commands=["rollback"])
     @admin_only
     def handle_rollback(message):
         if not os.path.exists("main.py.bak"):
-            bot.reply_to(message, "❌ Файл бэкапа `main.py.bak` не найден.")
+            bot.reply_to(message, "❌ Файл бэкапа не найден.")
             return
-        
-        bot.reply_to(message, "🔄 Восстанавливаю предыдущую версию из бэкапа...")
         try:
             shutil.move("main.py.bak", "main.py")
-            bot.reply_to(message, "✅ Бэкап восстановлен. Перезапускаю бота...")
+            bot.reply_to(message, "✅ Бэкап восстановлен. Перезапускаю...")
             bot.stop_polling()
             os.execv(sys.executable, [sys.executable] + sys.argv)
         except Exception as e:
-            bot.reply_to(message, f"❌ Не удалось восстановить бэкап: {e}")
+            bot.reply_to(message, f"❌ Ошибка отката: {e}")
 
-    # Standard bot handlers
-    @bot.message_handler(commands=['start', 'clear'])
-    def handle_start_clear(message):
-        chat_id = message.chat.id
-        if client:
-            chat_sessions[chat_id] = client.chats.create(model=GEMINI_MODEL)
-        
-        welcome_text = (
-            f"Привет! Я твой личный ИИ-ассистент на базе {GEMINI_MODEL}.\n"
-            "Я умею держать контекст нашей беседы. Чтобы очистить мою память, напиши /clear."
-        )
-        bot.reply_to(message, welcome_text)
-
-    @bot.message_handler(commands=['help'])
-    def handle_help(message):
-        help_text = (
-            "Доступные команды:\n"
-            "/start - Начать беседу сначала\n"
-            "/clear - Сбросить память бота\n"
-            "/help - Показать справочное сообщение\n"
-        )
-        if ADMIN_ID is not None and message.from_user.id == ADMIN_ID:
-            help_text += (
-                "\n👑 Админ-команды:\n"
-                "/update_code <код> - Обновить код бота (или прикрепите файл main.py с этой командой в подписи)\n"
-                "/rollback - Откатить код до предыдущей версии"
-            )
-        bot.reply_to(message, help_text)
-
-    @bot.message_handler(func=lambda message: True)
+    # ── Free-form messages → Gemini ──────────────────────────────────────────
+    @bot.message_handler(func=lambda m: True)
     def handle_message(message):
-        chat_id = message.chat.id
-        user_text = message.text
-        
+        cid = message.chat.id
         if not client:
-            bot.reply_to(message, "Ошибка: API-ключ Gemini не настроен.")
+            bot.reply_to(message, "❌ Gemini API не настроен.")
             return
-
-        bot.send_chat_action(chat_id, 'typing')
-        
+        bot.send_chat_action(cid, "typing")
         try:
-            if chat_id not in chat_sessions:
-                chat_sessions[chat_id] = client.chats.create(model=GEMINI_MODEL)
-            
-            chat = chat_sessions[chat_id]
-            response = chat.send_message(user_text)
+            if cid not in chat_sessions:
+                chat_sessions[cid] = client.chats.create(model=GEMINI_MODEL)
+            response = chat_sessions[cid].send_message(message.text)
             bot.reply_to(message, response.text)
         except Exception as e:
-            bot.reply_to(message, f"Произошла ошибка при генерации ответа: {e}")
+            bot.reply_to(message, f"❌ Ошибка Gemini: {e}")
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    if bot:
-        # Run HTTP Server in a daemon thread so it does not block telebot polling
-        threading.Thread(target=run_http_server, daemon=True).start()
-        print(f"Бот успешно запущен с моделью {GEMINI_MODEL}...")
-        bot.infinity_polling()
-    else:
-        print("Ошибка запуска: Настройте TELEGRAM_TOKEN and GEMINI_API_KEY в файле .env")
+    if not bot:
+        print("Ошибка: TELEGRAM_TOKEN не настроен.")
+        sys.exit(1)
+
+    # 1. Connect to Google Sheets (non-fatal if creds absent)
+    init_google_sheets()
+
+    # 2. Reminder checker background thread (fires every 60 s)
+    threading.Thread(target=reminder_checker, args=(bot,), daemon=True).start()
+
+    # 3. Render health-check HTTP server
+    threading.Thread(target=run_http_server, daemon=True).start()
+
+    print(f"Бот запущен с моделью {GEMINI_MODEL}.")
+    bot.infinity_polling()
